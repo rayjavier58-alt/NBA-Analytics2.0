@@ -100,6 +100,40 @@ def bajas_espn():
     return parsear_bajas(r.json())
 
 
+def total_bajas(df, juegan=()):
+    """Suma de bajas. Un jugador marcado como 'juega' deja de restar y, si venía faltando varios partidos,
+    suma un refuerzo (valor negativo) porque las estadísticas recientes del equipo ya reflejan su ausencia."""
+    if df is None or df.empty:
+        return 0.0
+    tot = 0.0
+    for _, r in df.iterrows():
+        tot += -r["Impacto si falta"] * r["Ya reflejado"] if r["Jugador"] in juegan else r["Aporte"]
+    return max(min(float(tot), 12.0), -12.0)
+
+
+def localia_auto(d, home, away):
+    """Ajuste automático (puntos de margen) de la ventaja de localía: la de la liga en el último año frente a la
+    media del entrenamiento, más una pequeña corrección por equipo (muy encogida: la muestra es corta)."""
+    x = d.copy()
+    x["mar"] = x.PTS - x.o_PTS
+    rec = x[x.GAME_DATE >= x.GAME_DATE.max() - pd.Timedelta(days=365)]
+    liga_rec = float(rec[rec.home == 1].mar.mean())
+    liga_ent = float(x[x.home == 1].mar.mean())
+
+    def ha(df):
+        h, a = df[df.home == 1].mar, df[df.home == 0].mar
+        return (h.mean() - a.mean()) / 2 if len(h) and len(a) else liga_rec
+
+    def dev(t):
+        s_ = rec[rec.TEAM_ABBREVIATION == t]
+        return len(s_) / (len(s_) + 150) * (ha(s_) - liga_rec)
+
+    eq = dev(home) - dev(away)
+    tot = float(max(min(liga_rec - liga_ent + eq, 3.0), -3.0))
+    return tot, (f"Localía de la liga en el último año: {liga_rec:+.1f} pts (entrenamiento {liga_ent:+.1f}); "
+                 f"ajuste por equipos {eq:+.1f}.")
+
+
 def estimar_bajas(pl, d, abbr, lista):
     """Impacto estimado (net rating perdido) de cada baja. Heurística propia, no un dato oficial:
     sale de la producción reciente (puntos + 0.7 asist. + 0.4 reb.) y se descuenta si el jugador
@@ -131,11 +165,11 @@ def estimar_bajas(pl, d, abbr, lista):
 
 def analizar_partido(b, d, home, away, *, spread=None, o_sh=-110, o_sa=-110, total=None, o_over=-110,
                      o_under=-110, ml_h=None, ml_a=None, tot_h=None, o_hover=-110, o_hunder=-110,
-                     tot_a=None, o_aover=-110, o_aunder=-110, inj_h=0.0, inj_a=0.0, peso=0.3, fecha=None):
+                     tot_a=None, o_aover=-110, o_aunder=-110, inj_h=0.0, inj_a=0.0, peso=0.3, localia=0.0, fecha=None):
     fecha = pd.Timestamp(fecha) if fecha else pd.Timestamp.today().normalize()
     X = m.make_X(m.team_state(d, home, fecha), m.team_state(d, away, fecha))
     mar0, tot0 = float(b["margin"].predict(X)[0]), float(b["total"].predict(X)[0])
-    mar, tot = mar0 - inj_h + inj_a, tot0 - 0.5 * (inj_h + inj_a)
+    mar, tot = mar0 + localia - inj_h + inj_a, tot0 - 0.5 * (inj_h + inj_a)
     if spread is not None:
         mar = peso * mar + (1 - peso) * (-spread)
     if total is not None:
@@ -162,7 +196,7 @@ def analizar_partido(b, d, home, away, *, spread=None, o_sh=-110, o_sa=-110, tot
         filas += ou(f"Puntos {H}", ph, m.SIG_P, tot_h, o_hover, o_hunder)
     if tot_a is not None:
         filas += ou(f"Puntos {V}", pa, m.SIG_P, tot_a, o_aover, o_aunder)
-    return {"home": H, "away": V, "mar0": mar0, "tot0": tot0, "mar": mar, "tot": tot, "ph": ph,
+    return {"home": H, "away": V, "mar0": mar0, "tot0": tot0, "localia": localia, "mar": mar, "tot": tot, "ph": ph,
             "pa": pa, "pw": pw, "tabla": pd.DataFrame(filas)}
 
 
@@ -246,8 +280,18 @@ def resumen(df, dia):
 
 CSS = """
 <style>
+@import url('https://fonts.googleapis.com/css2?family=Anton&display=swap');
 .block-container{padding-top:1.4rem;max-width:1200px}
-.arena{width:100%;display:block;border-radius:14px;margin-bottom:10px}
+.topbar{display:flex;align-items:flex-end;justify-content:space-between;gap:10px;overflow:hidden;
+ background:linear-gradient(180deg,#0a1a33,#122e57);border-radius:14px;padding:10px 16px 0;margin-bottom:10px;border-bottom:4px solid #c9a45c}
+.topbar .side{width:20%;max-width:210px;display:block}
+.titulo{flex:1;display:flex;align-items:center;justify-content:center;gap:16px;padding:14px 0 18px;text-align:center}
+.titulo .nba{font-family:Anton,Impact,'Arial Narrow',sans-serif;font-size:clamp(34px,6.5vw,76px);letter-spacing:.06em;
+ line-height:1;text-transform:uppercase;background:linear-gradient(180deg,#f6e7b8,#c9a45c 55%,#8a6a2b);
+ -webkit-background-clip:text;background-clip:text;color:transparent}
+.titulo .sub{margin-top:6px;font-size:clamp(10px,1.4vw,15px);letter-spacing:.35em;text-transform:uppercase;color:#c9a45c}
+.titulo .trofeo{height:clamp(54px,9vw,112px);width:auto;font-size:clamp(46px,8vw,96px);line-height:1}
+@media(max-width:700px){.topbar .side{display:none}}
 .match{display:grid;grid-template-columns:1fr 2fr 1fr;align-items:center;gap:12px;background:#0f1d33;color:#fff;
  border-radius:14px;padding:18px;margin:10px 0 14px}
 .team{text-align:center}.team img{width:84px;height:84px;object-fit:contain}
@@ -262,18 +306,6 @@ CSS = """
 @media(max-width:700px){.match{grid-template-columns:1fr}}
 </style>
 """
-
-CAMISETAS = [  # (apellido, número, ciudad, color de fondo, color del número)
-    ("JORDAN", 23, "CHICAGO", "#ce1141", "#ffffff"), ("JAMES", 23, "CLEVELAND", "#860038", "#fdbb30"),
-    ("NOWITZKI", 41, "DALLAS", "#00538c", "#c4ced4"), ("BIRD", 33, "BOSTON", "#007a33", "#ffffff"),
-    ("IVERSON", 3, "PHILADELPHIA", "#006bb6", "#ffffff"), ("BRYANT", 24, "LOS ANGELES", "#552583", "#fdb927"),
-    ("JOHNSON", 32, "LOS ANGELES", "#fdb927", "#552583"), ("DUNCAN", 21, "SAN ANTONIO", "#c4ced4", "#111111"),
-    ("STOCKTON", 12, "UTAH", "#002b5c", "#f9a01b"), ("WADE", 3, "MIAMI", "#98002e", "#f9a01b"),
-    ("OLAJUWON", 34, "HOUSTON", "#ce1141", "#ffffff"), ("EWING", 33, "NEW YORK", "#006bb6", "#f58426"),
-    ("MILLER", 31, "INDIANA", "#002d62", "#fdbb30"), ("PIPPEN", 33, "CHICAGO", "#ffffff", "#ce1141"),
-]
-JERSEY = "M11,0 L19,0 Q26,11 33,0 L41,0 L41,14 Q49,20 49,37 L49,84 L3,84 L3,37 Q3,20 11,14 Z"
-
 
 def _foto(nombre):
     for ext, mime in (("jpg", "jpeg"), ("jpeg", "jpeg"), ("png", "png"), ("webp", "webp")):
@@ -305,58 +337,21 @@ def _figura(cx, nombre, etiqueta, color, fg, numero):
     return cuerpo + placa
 
 
-def escena_svg():
-    o = ['<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 440">'
-         '<defs><linearGradient id="bg" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#16203c"/><stop offset="1" stop-color="#080b16"/></linearGradient>'
-         '<radialGradient id="g"><stop offset="0" stop-color="#fff6c8" stop-opacity=".55"/><stop offset="1" stop-color="#fff6c8" stop-opacity="0"/></radialGradient>'
-         '<linearGradient id="w" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#a5622a"/><stop offset="1" stop-color="#e2a75f"/></linearGradient>'
-         '<linearGradient id="sh" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#000" stop-opacity=".6"/><stop offset="1" stop-color="#000" stop-opacity=".1"/></linearGradient>'
-         '<pattern id="c" width="16" height="12" patternUnits="userSpaceOnUse"><circle cx="4" cy="4" r="3" fill="#9a4f4d"/>'
-         '<circle cx="12" cy="4" r="3" fill="#4f6f96"/><circle cx="8" cy="10" r="3" fill="#cfa84f"/></pattern></defs>'
-         '<rect width="1200" height="440" fill="url(#bg)"/>']
-    for x in (150, 450, 750, 1050):  # focos
-        o.append(f'<circle cx="{x}" cy="8" r="90" fill="url(#g)"/>')
-    o.append('<rect width="1200" height="14" fill="#10152a"/>')
-    for i, (nom, num, eq, bg, fg) in enumerate(CAMISETAS):  # camisetas colgando del techo
-        o.append(
-            f'<g transform="translate({8 + i * 85.2:.1f},22) scale(1.15)" font-family="Arial,sans-serif" font-weight="700" text-anchor="middle">'
-            f'<path d="M15,-22 V0 M37,-22 V0" stroke="#3b4262" stroke-width="1.2"/>'
-            f'<path d="{JERSEY}" fill="{bg}" stroke="#000" stroke-opacity=".45"/>'
-            f'<text x="26" y="38" font-size="7" fill="{fg}">{nom}</text>'
-            f'<text x="26" y="62" font-size="24" font-weight="900" fill="{fg}" font-family="Impact,Arial Black,sans-serif">{num}</text>'
-            f'<text x="26" y="76" font-size="5.6" fill="{fg}">{eq}</text></g>')
-    o.append('<text x="600" y="152" font-size="30" font-weight="900" text-anchor="middle" fill="#fff" letter-spacing="6" '
-             'font-family="Impact,Arial Black,sans-serif">ANALÍTICA NBA</text>')
-    o.append('<rect y="165" width="1200" height="85" fill="url(#c)"/><rect y="165" width="1200" height="85" fill="url(#sh)"/>')
-    for y in (186, 207, 228):
-        o.append(f'<rect y="{y}" width="1200" height="3" fill="#000" opacity=".5"/>')
-    for x in range(90, 1200, 150):
-        o.append(f'<rect x="{x}" y="165" width="6" height="85" fill="#000" opacity=".45"/>')
-    o.append('<rect y="246" width="1200" height="6" fill="#1a1f33"/><rect y="250" width="1200" height="190" fill="#0a0d18"/>')
-    o.append('<polygon points="353,250 847,250 1160,440 40,440" fill="url(#w)"/>')
-    for k in range(17):  # tablones en perspectiva
-        xb = 40 + k * 70
-        o.append(f'<line x1="{xb}" y1="440" x2="{600 + (xb - 600) * 0.441:.1f}" y2="250" stroke="#000" stroke-opacity=".12"/>')
-    o.append('<g fill="none" stroke="#fff" stroke-width="2" stroke-opacity=".9">'
-             '<path d="M353,250 L40,440 M847,250 L1160,440 M353,250 H847"/>'
-             '<polygon points="515,250 685,250 718,308 482,308" fill="#552583" fill-opacity=".55"/>'
-             '<ellipse cx="600" cy="308" rx="88" ry="24"/>'
-             '<path d="M368,250 L378,290 C450,390 750,390 822,290 L832,250"/></g>')
-    o.append('<rect x="596" y="226" width="8" height="24" fill="#20253a"/>'  # tablero y aro
-             '<rect x="570" y="190" width="60" height="36" fill="#f4f4f4" stroke="#999"/>'
-             '<rect x="587" y="206" width="26" height="20" fill="none" stroke="#e8542c" stroke-width="1.5"/>'
-             '<ellipse cx="600" cy="228" rx="14" ry="3.5" fill="none" stroke="#ff6a2a" stroke-width="2.5"/>'
-             '<path d="M587,229 L592,246 M594,230 L595,247 M600,231 V248 M606,230 L605,247 M613,229 L608,246" stroke="#fff" stroke-opacity=".8"/>')
-    o.append(_figura(103, "curry", "STEPHEN CURRY · 30", "#1d428a", "#ffc72c", 30))
-    o.append(_figura(1097, "lamelo", "LAMELO BALL · 1", "#00788c", "#ffffff", 1))
-    o.append('</svg>')
-    return "".join(o)
+def _lado(cx, nombre, etiqueta, color, fg, numero):
+    svg = (f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="{cx - 100} 205 200 235">'
+           f'{_figura(cx, nombre, etiqueta, color, fg, numero)}</svg>')
+    return f'<img class="side" alt="" src="data:image/svg+xml;base64,{base64.b64encode(svg.encode()).decode()}">'
 
 
 def hero_html():
-    """Escena de cancha. Fotos opcionales: curry.png/jpg y lamelo.png/jpg junto a app.py (si no, silueta con camiseta)."""
-    b64 = base64.b64encode(escena_svg().encode("utf-8")).decode()
-    return f'<img class="arena" alt="Cancha de la NBA con camisetas retiradas" src="data:image/svg+xml;base64,{b64}">'
+    """Banner: imagen a la izquierda, título al centro (con trofeo) e imagen a la derecha.
+    Fotos opcionales junto a app.py: curry.png, lamelo.png y trofeo.png (también .jpg/.webp)."""
+    izq = _lado(103, "curry", "STEPHEN CURRY · 30", "#1d428a", "#ffc72c", 30)
+    der = _lado(1097, "lamelo", "LAMELO BALL · 1", "#00788c", "#ffffff", 1)
+    t = _foto("trofeo")
+    trofeo = f'<img class="trofeo" alt="" src="{t}">' if t else '<span class="trofeo">🏆</span>'
+    return (f'<div class="topbar">{izq}<div class="titulo">{trofeo}<div><div class="nba">NBA Analytics</div>'
+            f'<div class="sub">Ganador · Spread · Totales · Props</div></div></div>{der}</div>')
 
 
 def tarjeta_partido(r):
@@ -401,7 +396,7 @@ def serie_balance(df):
 def ui():
     import streamlit as st
 
-    st.set_page_config(page_title="Analítica NBA", page_icon="🏀", layout="wide")
+    st.set_page_config(page_title="NBA Analytics", page_icon="🏀", layout="wide")
     st.markdown(CSS, unsafe_allow_html=True)
     st.markdown(hero_html(), unsafe_allow_html=True)
     st.caption("Ganador, spread, totales y props de jugador · el modelo es una segunda opinión, no una garantía")
@@ -432,6 +427,10 @@ def ui():
         if m.NUBE:
             st.caption("Versión en línea: los datos se actualizan desde la PC del dueño.")
         else:
+            if st.button("Actualizar partidos recientes (rápido)"):
+                st.cache_resource.clear()
+                st.rerun()
+            st.caption("Descarga los últimos partidos, sin reentrenar. Tarda unos segundos.")
             if st.button("Actualizar datos y reentrenar"):
                 with st.spinner("Descargando partidos y entrenando (unos minutos)…"):
                     m.train(m.default_seasons(), 10)
@@ -439,6 +438,10 @@ def ui():
                 st.success("Listo. Recarga la página.")
             st.caption("Hazlo una vez por semana. Las lesiones no las conoce el modelo: usa las casillas de bajas.")
     b, d, pl = datos()
+
+    @st.cache_data(ttl=300, show_spinner="Trayendo las bajas de ESPN…")
+    def bajas_hoy():
+        return bajas_espn()
     st.sidebar.caption(f"Datos hasta el {d.GAME_DATE.max():%d/%m/%Y}")
     equipos = sorted(d.TEAM_ABBREVIATION.unique())
     t1, t2, t3 = st.tabs(["Partido", "Props de jugador", "Mis picks"])
@@ -461,42 +464,46 @@ def ui():
 
     # ---------------------------------------------------------------- Partido
     with t1:
-        c1, c2, c3, c4 = st.columns(4)
+        c1, c2 = st.columns(2)
         home = c1.selectbox("Local", equipos, format_func=nombre,
                             index=equipos.index("LAL") if "LAL" in equipos else 0)
         c1.image(logo(home), width=70)
         away = c2.selectbox("Visitante", equipos, format_func=nombre,
                             index=equipos.index("POR") if "POR" in equipos else 1)
         c2.image(logo(away), width=70)
-        auto = st.session_state.get("bajas_auto")
-        ah, aa = (auto["h"], auto["a"]) if auto and auto["equipos"] == (home, away) else (0.0, 0.0)
-        inj_h = c3.number_input("Bajas local (net rating)", 0.0, 15.0, float(round(ah, 1)), 0.5,
-                                key=f"injh_{ah:.1f}_{home}", help="Estrella 3-5, rotación 1-2")
-        inj_a = c4.number_input("Bajas visitante (net rating)", 0.0, 15.0, float(round(aa, 1)), 0.5,
-                                key=f"inja_{aa:.1f}_{away}")
-        peso = st.slider("Peso del modelo frente a la línea de la casa", 0.0, 1.0, 0.3, 0.05)
-        if st.button("Traer bajas automáticas (ESPN)"):
+        usar_auto = st.checkbox("Bajas y localía automáticas", value=True,
+                                help="Trae las lesiones de ESPN y ajusta la ventaja de local con los partidos recientes")
+        th = ta = None
+        if usar_auto:
             try:
-                todas = bajas_espn()
+                todas = bajas_hoy()
                 th = estimar_bajas(pl, d, home, todas.get(home, []))
                 ta = estimar_bajas(pl, d, away, todas.get(away, []))
-                st.session_state["bajas_auto"] = {
-                    "equipos": (home, away), "h": min(float(th["Aporte"].sum()), 12.0),
-                    "a": min(float(ta["Aporte"].sum()), 12.0), "th": th, "ta": ta}
-                st.rerun()
             except Exception as e:
-                st.error(f"No se pudieron traer las bajas ({type(e).__name__}). Escribe el número a mano.")
-        if auto and auto["equipos"] == (home, away):
-            with st.expander("Bajas detectadas y su impacto estimado", expanded=True):
-                for etiqueta, clave in ((nombre(home), "th"), (nombre(away), "ta")):
-                    st.markdown(f"**{etiqueta}**")
-                    t_ = auto[clave]
-                    if t_.empty:
-                        st.caption("Sin bajas reportadas.")
-                    else:
-                        st.dataframe(t_.round(2), hide_index=True)
-                st.caption("Estimación propia a partir de la producción reciente de cada jugador. "
-                           "Si no cuadra con tu criterio, cambia el número de arriba a mano.")
+                st.warning(f"No se pudieron traer las bajas de ESPN ({type(e).__name__}). Se usa 0; "
+                           "puedes ajustarlas a mano abajo.")
+        kj_h, kj_a = f"juegan_h_{home}_{away}", f"juegan_a_{home}_{away}"
+        inj_h = total_bajas(th, st.session_state.get(kj_h, [])) + st.session_state.get("man_h", 0.0)
+        inj_a = total_bajas(ta, st.session_state.get(kj_a, [])) + st.session_state.get("man_a", 0.0)
+        loc, loc_info = localia_auto(d, home, away) if usar_auto else (0.0, "")
+        peso = st.slider("Peso del modelo frente a la línea de la casa", 0.0, 1.0, 0.3, 0.05)
+        with st.expander("Bajas detectadas y localía (se calculan solas)", expanded=True):
+            for etiqueta, t_, k in ((nombre(home), th, kj_h), (nombre(away), ta, kj_a)):
+                st.markdown(f"**{etiqueta}**")
+                if t_ is None or t_.empty:
+                    st.caption("Sin bajas reportadas.")
+                else:
+                    st.dataframe(t_.round(2), hide_index=True)
+                    st.multiselect("Suponer que SÍ juegan", t_["Jugador"].tolist(), key=k)
+            m1, m2, m3 = st.columns(3)
+            m1.metric(f"Bajas {home}", f"{inj_h:+.1f}")
+            m2.metric(f"Bajas {away}", f"{inj_a:+.1f}")
+            m3.metric("Localía automática", f"{loc:+.1f}")
+            st.caption((loc_info + " " if loc_info else "") + "Las bajas son una estimación propia a partir de la "
+                       "producción reciente de cada jugador y de su estado en ESPN (negativo = refuerzo).")
+            a1, a2 = st.columns(2)
+            a1.number_input("Ajuste manual bajas local (opcional)", -15.0, 15.0, 0.0, 0.5, key="man_h")
+            a2.number_input("Ajuste manual bajas visitante (opcional)", -15.0, 15.0, 0.0, 0.5, key="man_a")
         st.markdown("**Líneas y momios** (deja en 0 los mercados que no quieras)")
         g1, g2, g3 = st.columns(3)
         with g1:
@@ -529,12 +536,12 @@ def ui():
                     ml_h=ml_h or None, ml_a=ml_a or None,
                     tot_h=tot_h if tot_h != 0 else None, o_hover=oh1, o_hunder=oh2,
                     tot_a=tot_a if tot_a != 0 else None, o_aover=oa1, o_aunder=oa2,
-                    inj_h=inj_h, inj_a=inj_a, peso=peso)
+                    inj_h=inj_h, inj_a=inj_a, peso=peso, localia=loc)
         r = st.session_state.get("partido")
         if r:
             st.markdown(tarjeta_partido(r), unsafe_allow_html=True)
             st.caption(f"Modelo puro: margen {r['mar0']:+.1f}, total {r['tot0']:.1f}. "
-                       f"Ajustado con bajas y línea: margen {r['mar']:+.1f}, total {r['tot']:.1f}.")
+                       f"Ajustado con bajas, localía y línea: margen {r['mar']:+.1f}, total {r['tot']:.1f}.")
             if not r["tabla"].empty:
                 mostrar(r["tabla"])
                 registrar("p", r["tabla"], f"{r['home']}-{r['away']}")
