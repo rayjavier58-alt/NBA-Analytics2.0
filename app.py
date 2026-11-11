@@ -223,6 +223,102 @@ def analizar_prop(b, d, pl, nombre, stat, linea, o_over, o_under, opp, home, *, 
     return {"equipo": propio, "pred": pred, "puro": modelo_puro, "sd": sd, "min_tend": r["e_MIN"], "tabla": tabla}
 
 
+# ----------------------------------------------------- calendario y momios del día
+ESPN_CALENDARIO = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard"
+
+
+def _f(x):
+    """Convierte '-110', '+120', 'o229.5', 'EVEN' en número; None si no se puede."""
+    t = str(x).strip().lower().replace("o", "", 1) if str(x).strip().lower().startswith("o") else str(x).strip().lower()
+    t = t[1:] if t.startswith("u") else t
+    if t in ("even", "ev"):
+        return 100.0
+    try:
+        return float(t)
+    except ValueError:
+        return None
+
+
+def _primero(*v):
+    return next((x for x in v if x is not None), None)
+
+
+def _abbr(team):
+    ult = str(team.get("displayName", "")).split()[-1].lower() if team.get("displayName") else ""
+    return next((ab for ab, (nom, _) in EQUIPOS.items() if nom.split()[-1].lower() == ult), None)
+
+
+def parsear_odds(odds):
+    """Momios del partido a partir del bloque 'odds' de ESPN (acepta sus dos formatos)."""
+    if not odds:
+        return {}
+    o = odds[0] if isinstance(odds, list) else odds
+    cierre = lambda blq, lado: ((blq.get(lado) or {}).get("close") or (blq.get(lado) or {}).get("open") or {})
+    ps, tt, ml = o.get("pointSpread") or {}, o.get("total") or {}, o.get("moneyline") or {}
+    out = {
+        "fuente": (o.get("provider") or {}).get("name", "ESPN"),
+        "spread": _primero(_f(cierre(ps, "home").get("line")), _f(o.get("spread"))),
+        "o_sh": _f(cierre(ps, "home").get("odds")), "o_sa": _f(cierre(ps, "away").get("odds")),
+        "total": _primero(_f(cierre(tt, "over").get("line")), _f(o.get("overUnder"))),
+        "o_over": _f(cierre(tt, "over").get("odds")), "o_under": _f(cierre(tt, "under").get("odds")),
+        "ml_h": _primero(_f(cierre(ml, "home").get("odds")), _f((o.get("homeTeamOdds") or {}).get("moneyLine"))),
+        "ml_a": _primero(_f(cierre(ml, "away").get("odds")), _f((o.get("awayTeamOdds") or {}).get("moneyLine"))),
+    }
+    return {k: v for k, v in out.items() if v is not None}
+
+
+def parsear_calendario(data):
+    juegos = []
+    for e in data.get("events", []):
+        comp = (e.get("competitions") or [{}])[0]
+        eq = {c.get("homeAway"): _abbr(c.get("team") or {}) for c in comp.get("competitors", [])}
+        if not eq.get("home") or not eq.get("away"):
+            continue
+        hora = pd.to_datetime(e.get("date"), utc=True).tz_convert("America/Mexico_City")
+        estado = (((comp.get("status") or e.get("status") or {}).get("type") or {}).get("description")) or ""
+        juegos.append({"id": str(e.get("id")), "home": eq["home"], "away": eq["away"], "hora": hora,
+                       "estado": estado, "odds": parsear_odds(comp.get("odds"))})
+    return sorted(juegos, key=lambda j: j["hora"])
+
+
+def calendario_espn(fecha):
+    import requests
+
+    r = requests.get(ESPN_CALENDARIO, params={"dates": pd.Timestamp(fecha).strftime("%Y%m%d")}, timeout=15)
+    r.raise_for_status()
+    return parsear_calendario(r.json())
+
+
+def analisis_juego(b, d, pl, j, bajas, odds=None, juegan_h=(), juegan_a=(), man_h=0.0, man_a=0.0, peso=0.3):
+    """Análisis completo de un partido del calendario: bajas, localía y momios incluidos."""
+    o = {**j["odds"], **(odds or {})}
+    th = estimar_bajas(pl, d, j["home"], bajas.get(j["home"], []))
+    ta = estimar_bajas(pl, d, j["away"], bajas.get(j["away"], []))
+    inj_h, inj_a = total_bajas(th, juegan_h) + man_h, total_bajas(ta, juegan_a) + man_a
+    loc, loc_info = localia_auto(d, j["home"], j["away"])
+    d110 = lambda k: o.get(k, -110)
+    r = analizar_partido(
+        b, d, j["home"], j["away"], spread=o.get("spread"), o_sh=d110("o_sh"), o_sa=d110("o_sa"),
+        total=o.get("total"), o_over=d110("o_over"), o_under=d110("o_under"), ml_h=o.get("ml_h"), ml_a=o.get("ml_a"),
+        inj_h=inj_h, inj_a=inj_a, peso=peso, localia=loc)
+    return {"r": r, "th": th, "ta": ta, "inj_h": inj_h, "inj_a": inj_a, "loc": loc, "loc_info": loc_info}
+
+
+def recomendacion(tabla, dudas=0):
+    """Texto corto con lo que marca el sistema: los mercados CASHHH ordenados por ventaja."""
+    if tabla is None or tabla.empty:
+        return "Sin momios"
+    c = tabla[tabla["Señal"] == "CASHHH"].sort_values("Ventaja (pts)", ascending=False)
+    if c.empty:
+        txt = "Sin ventaja clara"
+    else:
+        t = c.iloc[0]
+        txt = f"CASHHH · {t['Mercado']} ({t['Ventaja (pts)']:+.1f})"
+        if t["Ventaja (pts)"] > 10:
+            txt += " · revisar: diferencia muy grande"
+    return txt + (f" · {dudas} en duda" if dudas else "")
+
+
 def ganancia(r):
     try:
         mo, mt = float(r["momio"]), float(r["monto"])
@@ -444,7 +540,7 @@ def ui():
         return bajas_espn()
     st.sidebar.caption(f"Datos hasta el {d.GAME_DATE.max():%d/%m/%Y}")
     equipos = sorted(d.TEAM_ABBREVIATION.unique())
-    t1, t2, t3 = st.tabs(["Partido", "Props de jugador", "Mis picks"])
+    t0, t1, t2, t3 = st.tabs(["Hoy", "Partido", "Props de jugador", "Mis picks"])
 
     def mostrar(tabla):
         st.dataframe(estilo_tabla(tabla), hide_index=True)
@@ -461,6 +557,99 @@ def ui():
             fila_ = tabla[tabla["Mercado"] == sel].iloc[0]
             agregar_pick(f"{prefijo} {sel}".strip(), int(fila_["Cuota"]), monto)
             st.success("Guardado en 'Mis picks'.")
+
+    # -------------------------------------------------------------------- Hoy
+    with t0:
+        hoy = pd.Timestamp.today().date()
+        f1, f2 = st.columns([1, 3])
+        fecha = f1.date_input("Día", value=hoy, key="dia_cal")
+        f2.write("")
+        if f2.button("Ver juegos de hoy", type="primary"):
+            with st.spinner("Buscando calendario, momios y bajas…"):
+                try:
+                    juegos = calendario_espn(fecha)
+                    try:
+                        bajas = bajas_hoy()
+                    except Exception:
+                        bajas = {}
+                    res = []
+                    for j in juegos:
+                        try:
+                            A = analisis_juego(b, d, pl, j, bajas)
+                            dudas = int(sum(t_["Estado"].astype(str).str.lower().str.contains("day|question").sum()
+                                            for t_ in (A["th"], A["ta"])))
+                            res.append({**j, "rec": recomendacion(A["r"]["tabla"], dudas)})
+                        except Exception:
+                            res.append({**j, "rec": "Sin datos"})
+                    st.session_state["hoy"] = {"juegos": res, "bajas": bajas}
+                    st.session_state.pop("juego", None)
+                except Exception as e:
+                    st.error(f"No se pudo traer el calendario ({type(e).__name__}). Revisa tu conexión e intenta de nuevo.")
+        H = st.session_state.get("hoy")
+        if not H:
+            st.info("Pulsa «Ver juegos de hoy» para traer el calendario con los momios y lo que marca el sistema.")
+        elif st.session_state.get("juego") is None:
+            if not H["juegos"]:
+                st.warning("No hay juegos de la NBA ese día.")
+            for j in H["juegos"]:
+                with st.container(border=True):
+                    k1, k2, k3, k4 = st.columns([3, 1.2, 3, 1])
+                    k1.markdown(f'<img src="{logo(j["away"])}" width="30"> **{nombre(j["away"])}** @ '
+                                f'<img src="{logo(j["home"])}" width="30"> **{nombre(j["home"])}**',
+                                unsafe_allow_html=True)
+                    k2.write(f"{j['hora']:%I:%M %p}")
+                    k2.caption(j["estado"])
+                    o = j["odds"]
+                    k3.write(" · ".join(x for x in (
+                        f"{j['home']} {o['spread']:+g}" if "spread" in o else "",
+                        f"Total {o['total']:g}" if "total" in o else "") if x) or "Sin momios")
+                    k3.caption(j["rec"])
+                    if k4.button("Abrir", key=f"abrir_{j['id']}"):
+                        st.session_state["juego"] = j
+                        st.rerun()
+            st.caption("Los momios se traen de ESPN y sirven de referencia. Playdoit no ofrece datos públicos, "
+                       "así que en cada partido puedes cambiarlos por los de tu casa.")
+        else:
+            j, pid = st.session_state["juego"], st.session_state["juego"]["id"]
+            if st.button("← Volver a los juegos de hoy"):
+                st.session_state.pop("juego")
+                st.rerun()
+            o = j["odds"]
+            with st.expander("Momios (cámbialos por los de tu casa; 0 = no usar)"):
+                g1, g2, g3 = st.columns(3)
+                ml_h = g1.number_input("Ganador local", value=int(o.get("ml_h", 0)), step=5, key=f"{pid}_mlh")
+                ml_a = g1.number_input("Ganador visitante", value=int(o.get("ml_a", 0)), step=5, key=f"{pid}_mla")
+                sp = g2.number_input("Spread del local", value=float(o.get("spread", 0.0)), step=0.5, key=f"{pid}_sp")
+                osh = g2.number_input("Momio spread local", value=int(o.get("o_sh", -110)), step=1, key=f"{pid}_osh")
+                osa = g2.number_input("Momio spread visitante", value=int(o.get("o_sa", -110)), step=1, key=f"{pid}_osa")
+                tl = g3.number_input("Total", value=float(o.get("total", 0.0)), step=0.5, key=f"{pid}_tl")
+                oo = g3.number_input("Momio over", value=int(o.get("o_over", -110)), step=1, key=f"{pid}_oo")
+                ou = g3.number_input("Momio under", value=int(o.get("o_under", -110)), step=1, key=f"{pid}_ou")
+            mios = {"spread": sp or None, "o_sh": osh, "o_sa": osa, "total": tl or None, "o_over": oo, "o_under": ou,
+                    "ml_h": ml_h or None, "ml_a": ml_a or None}
+            kh, ka = f"jh_{pid}", f"ja_{pid}"
+            A = analisis_juego(b, d, pl, j, H["bajas"], mios, st.session_state.get(kh, []),
+                               st.session_state.get(ka, []))
+            r = A["r"]
+            st.markdown(tarjeta_partido(r), unsafe_allow_html=True)
+            dudas = int(sum(t_["Estado"].astype(str).str.lower().str.contains("day|question").sum()
+                            for t_ in (A["th"], A["ta"])))
+            st.success("Sistema: " + recomendacion(r["tabla"], dudas))
+            if dudas:
+                st.warning(f"Hay {dudas} jugadores en duda (GTD). Confirma las alineaciones antes de apostar.")
+            if not r["tabla"].empty:
+                mostrar(r["tabla"])
+                registrar("hoy", r["tabla"], f"{r['home']}-{r['away']}")
+            with st.expander("Bajas y localía (automáticas)"):
+                for etiqueta, t_, kk in ((nombre(j["home"]), A["th"], kh), (nombre(j["away"]), A["ta"], ka)):
+                    st.markdown(f"**{etiqueta}**")
+                    if t_.empty:
+                        st.caption("Sin bajas reportadas.")
+                    else:
+                        st.dataframe(t_.round(2), hide_index=True)
+                        st.multiselect("Suponer que SÍ juegan", t_["Jugador"].tolist(), key=kk)
+                st.caption(f"Bajas {j['home']} {A['inj_h']:+.1f} · {j['away']} {A['inj_a']:+.1f} · "
+                           f"localía {A['loc']:+.1f}. {A['loc_info']}")
 
     # ---------------------------------------------------------------- Partido
     with t1:
